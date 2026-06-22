@@ -32,6 +32,7 @@ This repository shares scripts that help obtain Raptor embeddings from medical v
 ### 1. Main scripts
 * `create_projector.py`: Generates and saves random projection matrices that will be used in the embedding.
 * `embed.py`: Creates Raptor embeddings given medical volumes (nii.gz, zip) and other configurations.
+* `create_downsampled_oct_npz.py`: Optional helper to cache normalized, downsampled OCT volumes before embedding.
 
 ### 2. Other scripts
 * `nns.py`: Predefined torch models for downstream prediction.
@@ -58,6 +59,8 @@ The Raptor codebase only requires a few dependencies such as pytorch, tqdm, and 
 conda env create -f environment.yml
 ```
 
+If you use DINOv3, make sure your environment has a Transformers version that supports `dinov3_vit`, and that your Hugging Face account has access to the selected DINOv3 checkpoint.
+
 ### Datasets
 
 The UK Biobank data can be downloaded through an approval process at [ukbiobank.ac.uk](https://www.ukbiobank.ac.uk). The 3D MedMNIST data can be downloaded from [medmnist.com](https://medmnist.com).
@@ -65,20 +68,26 @@ The UK Biobank data can be downloaded through an approval process at [ukbiobank.
 ## ✨ Creating Raptor embeddings
 
 The `embed.py` script can be used to generate Raptor embeddings. But first, random projection matrices should be generated and saved such that embeddings are replicable.
-The option `--d` should specify the token dimension of the ViT that will be used. By default we use DINO, which has tokens of size 1024.
+The option `--d` should specify the token dimension of the ViT that will be used. By default we use DINO/DINOv2, which has tokens of size 1024.
 
 ```bash
 python create_projector.py --seed 0 --d 1024 --k 100 --saveas data/proj_normal_d1024_k100_run1
+```
+
+For DINOv3, use a 4096-dimensional projector:
+
+```bash
+python create_projector.py --seed 0 --d 4096 --k 100 --saveas data/proj_normal_d4096_k100_run1
 ```
 
 The embeddings can be obtained in parallel using many GPUs to save time (or a single GPU can also be used).
 To keep track of these jobs, `embed.py` looks for a manifest file which is simply the list of volume files to process.
 
 > [!NOTE]
-> **.zip**: Volumes will be assumed to follow a UKBB specific folder structure
+> **.zip with `--folder`**: Volumes will be assumed to follow a UKBB specific folder structure, and `--extract_file` will be read from each zip.
 
 > [!NOTE]
-> **.nii.gz**: Can be any generic medical volume
+> **OCT zip files**: Use `--oct_path_list` for OCT image-slice zip files.
 
 For example, `data/20252_wbu_inst2_idps.txt`:
 ```csv
@@ -103,6 +112,15 @@ test_1
 ...
 ```
 
+For OCT image folders, OCT zip files, or one-volume `.npz` files, the manifest should contain absolute paths:
+
+```csv
+/path/to/oct_volume_001
+/path/to/oct_volume_002.npz
+/path/to/oct_volume_003.zip
+...
+```
+
 Given the manifest file, the embedding script can be run such as:
 
 ```bash
@@ -122,10 +140,50 @@ python -u embed.py --npz /u/project/sgss/UKBB/raptor/medmnist/nodulemnist3d_64.n
     --k data/proj_normal_d1024_k100_run1.npy
 ```
 
+or the following for OCT paths with DINOv3:
+
+```bash
+python -u embed.py --oct_path_list \
+    --encoder DINOv3 --manifest data/oct_paths.txt \
+    --start 0 --many 100 --batch_size 8 \
+    --planes ACS --subsample_factor 4 --resize_mode global_pad \
+    --skip_existing --continue_on_error --errors_log data/oct_errors.tsv \
+    --saveto data/embs/oct_DINOv3 \
+    --k data/proj_normal_d4096_k100_run1.npy
+```
+
 Some important options are:
 * `--folder /u/project/u/sgss/UKBB/imaging/bulk/20252` is the folder where the script will look for files listed in the manifest
 * `--start` and `--many` specify which entries in the manifest this script should process
 * `--saveto /u/scratch/u/ulzee/raptor/data/embs/may19_DINO_ukbb20252` is where embeddings will be saved
+* `--encoder` can be `DINO`, `DINOv2`, `DINOv3`, `CLIP`, `SAM`, `MedSAM`, or `LlavaMed` when the corresponding model dependencies/checkpoints are available
+* `--planes` selects the volume views to embed, for example `A,C,S`, `ACS`, `A`, or `C,S`
+* `--skip_existing` resumes an interrupted run without recomputing existing embeddings
+* `--continue_on_error --errors_log errors.tsv` records failed volumes and continues processing the rest of the manifest
+
+### Input formats
+
+`embed.py` supports several mutually exclusive input modes:
+
+* `--folder`: UKBB-style zip files listed in the manifest. The script extracts `--extract_file` from each zip.
+* `--npz`: MedMNIST-style npz blobs with `train_images`, `val_images`, and `test_images`.
+* `--oct_npz_folder`: OCT `.npz` files in one folder, with manifest entries relative to that folder or absolute paths.
+* `--oct_image_folder`: one OCT image-slice folder per manifest entry.
+* `--oct_path_list`: absolute OCT paths in the manifest. Each entry can be an image-slice folder, a `.npz`, or a `.zip`.
+
+OCT `.npz` files may contain `oct_volume_normalized`, `oct_volume`, or one array. Non-normalized OCT inputs are percentile-normalized to `[0, 1]`.
+
+### Slice resizing
+
+Before encoding each 2D slice, Raptor resizes it to the image encoder input size.
+
+* `--resize_mode stretch`: default/original behavior. Each slice is resized directly to `224 x 224`.
+* `--resize_mode pad`: preserves the aspect ratio of each 2D slice independently and pads to `224 x 224`.
+* `--resize_mode global_pad`: computes one scale from the full 3D volume, applies that same scale to every A/C/S slice, and pads to `224 x 224`. This preserves voxel-count proportions across views and is recommended when cross-view geometry matters.
+
+`--subsample_factor` can be used to equidistantly subsample every volume axis before slicing. For example, `--subsample_factor 4` keeps approximately one fourth of each axis while preserving coverage from the first to the last index.
+
+Additional examples are provided in `scripts/examples/`.
 
 > [!NOTE]
 > UCLA specific: `scripts/ucla/hoffman/embed_ukbb.sh` is one way the jobs can be parallelized on Hoffman (also part of `workflow_ukbb20252_idps.sh`).
